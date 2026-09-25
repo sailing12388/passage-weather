@@ -1,0 +1,16 @@
+{
+ "denarau": {
+  "lat": -17.7714,
+  "lon": 177.3702,
+  "name": "Denarau",
+  "source": "added by hand",
+  "tz": "Pacific/Fiji"
+ },
+ "port resolution": {
+  "lat": -19.5277,
+  "lon": 169.4959,
+  "name": "Port Resolution",
+  "source": "added by hand",
+  "tz": "Pacific/Efate"
+ }
+}

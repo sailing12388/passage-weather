@@ -1,0 +1,21 @@
+# forecast downloads, trip folders and rendered pages: all regenerated, and large
+data/
+trips/
+output/
+
+# local configuration: boat name, limits, polars chosen, Home Assistant host
+settings.json
+
+# optional inputs that aren't ours to redistribute
+OpenCPN Polar.zip
+*.grb2
+*.grib2
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.~lock.*#

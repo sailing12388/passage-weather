@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "passage-weather"
+version = "0.1.0"
+description = "Departure windows for a sailing passage: ensemble forecasts, your boat's polar, sea state and comfort, with a local web GUI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["sailing", "cruising", "weather", "passage planning", "ensemble forecast", "grib", "marine"]
+dependencies = ["numpy>=1.24", "requests>=2.28"]
+
+[project.optional-dependencies]
+charts = ["matplotlib>=3.6"]          # weather maps and the along-track panels
+grib = ["eccodes>=2.35"]              # only for tools/grib_compare.py
+
+[project.scripts]
+passage-weather = "webapp:main"
+
+[project.gui-scripts]
+passage-weather-gui = "webapp:main"   # Windows: launches with no console window
+
+[tool.setuptools]
+py-modules = ["webapp", "passage", "screen", "daily", "full_report", "report_html", "windows", "polar",
+              "comfort", "seastate", "route", "trip", "fetch", "synoptic", "synoptic_report", "settings",
+              "ha_publish"]
