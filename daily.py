@@ -45,8 +45,12 @@ def day_stats(log, depart, arrive):
             days.append(None)
             continue
         hs = np.array([np.nanmax([x["hs_ecmwf_wam025"], x["hs_ncep_gfswave025"]]) for x in steps])
-        ratio = np.array([np.nanmin([x["per_ecmwf_wam025"] / x["hs_ecmwf_wam025"],
-                                     x["per_ncep_gfswave025"] / x["hs_ncep_gfswave025"]]) for x in steps])
+        ratio = np.array([np.nanmin([windows.feet_ratio(x["peak_ecmwf_wam025"], x["hs_ecmwf_wam025"]),
+                                     windows.feet_ratio(x["peak_ncep_gfswave025"], x["hs_ncep_gfswave025"])])
+                          for x in steps])
+        steep_n = np.array([np.nanmin([windows.steepness_n(x["peak_ecmwf_wam025"], x["hs_ecmwf_wam025"]),
+                                       windows.steepness_n(x["peak_ncep_gfswave025"], x["hs_ncep_gfswave025"])])
+                            for x in steps])
         lv = np.array([x["comfort"] for x in steps])
         hours_at = [float((lv == k).sum() * windows.STEP_H) for k in range(len(LEVELS))]
         cum = np.cumsum(hours_at)                    # hours at this level or worse
@@ -65,6 +69,7 @@ def day_stats(log, depart, arrive):
                                                  np.mean([np.cos(np.radians(x["twd"])) for x in steps]))) % 360),
             twa_mean=np.mean([x["course_twa"] for x in steps]),
             hs_max=float(np.nanmax(hs)), ratio_min=float(np.nanmin(ratio)),
+            ratio_med=float(np.nanmedian(ratio)), steep_n=float(np.nanmedian(steep_n)),
             per_at_max=float(np.nanmax([x["per_ecmwf_wam025"] if x["hs_ecmwf_wam025"] >= x["hs_ncep_gfswave025"]
                                         else x["per_ncep_gfswave025"] for x in steps
                                         if np.nanmax([x["hs_ecmwf_wam025"], x["hs_ncep_gfswave025"]]) >= np.nanmax(hs) - 1e-9]
@@ -145,13 +150,13 @@ def report(route_name, depart_fjt, results, manifest):
                                               np.median([np.cos(np.radians(x["twd_mean"])) for x in ds]))) % 360)
             lines.append(
                 f"| {k + 1} | {end:%a %d %H:%M} | {g('tws_mean'):.0f} / {g('tws_max'):.0f} ({g('gust_max'):.0f}) "
-                f"| {twd:03.0f} | {g('twa_mean'):.0f} | {g('hs_max'):.1f} m, {g('ratio_min'):.1f} "
+                f"| {twd:03.0f} | {g('twa_mean'):.0f} | {g('hs_max'):.1f} m, {g('ratio_med'):.2f} "
                 f"| {g('speed'):.1f} | {g('dist'):.0f} ({g('dist', 10):.0f}–{g('dist', 90):.0f}) "
                 f"| {g('end_nm'):.0f} | {g('motor_h'):.1f} | {main} / {worst} |"
                 + ("" if len(ds) == len(members) else f" {len(ds)} of {len(members)} still sailing"))
             csv_rows.append([pname, k + 1, f"{end:%Y-%m-%d %H:%M}", len(ds)] +
                             [round(g(key, p), 2) for key in ("tws_mean", "tws_max", "gust_max", "twa_mean",
-                                                             "hs_max", "ratio_min", "speed", "dist", "end_nm",
+                                                             "hs_max", "ratio_med", "ratio_min", "steep_n", "speed", "dist", "end_nm",
                                                              "motor_h") for p in (10, 50, 90)] +
                             [round(twd), main, worst])
         lines.append("")
@@ -166,7 +171,7 @@ def report(route_name, depart_fjt, results, manifest):
         wr = csv.writer(fh)
         wr.writerow(["polar", "day", "ends_fjt", "members"] +
                     [f"{key}_p{p}" for key in ("tws_mean", "tws_max", "gust_max", "twa_mean", "hs_max",
-                                               "ratio_min", "speed", "dist", "end_nm", "motor_h")
+                                               "ratio_med", "ratio_min", "steep_n", "speed", "dist", "end_nm", "motor_h")
                      for p in (10, 50, 90)] + ["twd_mean", "comfort_main", "comfort_worst3h"])
         wr.writerows(csv_rows)
     return md

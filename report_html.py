@@ -5,6 +5,7 @@ Usage: python3 report_html.py port_vila "2026-09-14 12:00" ["Title override"]
 """
 import base64
 import html
+import math
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ import numpy as np
 
 import comfort
 import daily
+import fetch
 import polar
 import route
 import settings
@@ -87,6 +89,18 @@ def boat_label():
     """The boat name for the page headers, falling back to the type, then to a neutral label."""
     b = settings.get()["boat"]
     return b.get("name") or b.get("kind") or "Passage weather"
+
+
+def steep_sub(n):
+    return f", 1 in {n:.0f}" if n is not None and math.isfinite(n) else ""
+
+
+def feet_text(feet_ratio, worst=None):
+    """The feet rule as it reads on the page: period in seconds per foot of wave height."""
+    if feet_ratio is None or not math.isfinite(feet_ratio):
+        return "no seas"
+    tail = f", steepest {worst:.1f}" if worst is not None and math.isfinite(worst) else ""
+    return f"{feet_ratio:.1f} : 1{tail}"
 
 
 def screen_current(kt):
@@ -180,7 +194,7 @@ def build(route_name, depart_fjt, run_dir=None, syn_dir=None, bulletin=None, ctx
             rows.append(dict(
                 day=k + 1, end=depart_fjt + timedelta(days=k + 1), n=len(ds), of=len(members),
                 tws=g("tws_mean"), tws_max=g("tws_max"), gust=g("gust_max"), twd=twd, twa=g("twa_mean"),
-                hs=g("hs_max"), per=float(np.nanmedian([x.get("per_at_max", np.nan) for x in ds])), ratio=g("ratio_min"), speed=g("speed"), dist=g("dist"), d10=g("dist", 10),
+                hs=g("hs_max"), per=float(np.nanmedian([x.get("per_at_max", np.nan) for x in ds])), ratio=g("ratio_med"), ratio_worst=g("ratio_min"), steep_n=g("steep_n"), speed=g("speed"), dist=g("dist"), d10=g("dist", 10),
                 d90=g("dist", 90), total=g("end_nm"), motor=g("motor_h"), fuel=g("fuel_gal"),
                 main=daily.LEVELS[int(round(np.median([x["level_main"] for x in ds])))],
                 worst=daily.LEVELS[int(np.floor(np.median([x["level_worst3"] for x in ds])))],
@@ -206,6 +220,8 @@ def build(route_name, depart_fjt, run_dir=None, syn_dir=None, bulletin=None, ctx
     if bulletin is None and legacy:
         bulletin = latest_bulletin()
     return dict(route_name=route_name, depart_fjt=depart_fjt, manifest=manifest, smeta=smeta, polars=polars,
+                age=fetch.data_age(manifest), syn_age=fetch.data_age(smeta),
+                built_utc=datetime.now(timezone.utc),
                 story=story, arrival=arrival, track_png=track_png, bulletin=bulletin, track=track, ctx=ctx,
                 sea_days=sea_days, sea_passage=sea_passage, have_charts=have_charts,
                 charts_dir=charts)
@@ -355,6 +371,16 @@ def render(b, title):
     def runs(models):
         return ", ".join(f"{esc_(v['label'])} {esc_(v['run'] or 'run time not published')}" for v in models.values())
 
+    def ages(age):
+        """Every model cycle this brief used, and how old it was when the brief was built."""
+        parts = []
+        for m in age["models"].values():
+            old = f"{m['age_h']:.0f} h old" if m["age_h"] is not None else "age not published"
+            parts.append(f"{esc_(m['label'])} {old}")
+        return ", ".join(parts)
+
+    stale_note = (" <b>Some of this data is past its freshness limit.</b>"
+                  if b["age"]["stale"] or b["syn_age"]["stale"] else "")
     h = []
     h.append(f"""<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(title)}</title>
@@ -366,7 +392,8 @@ def render(b, title):
   <div class="eyebrow">{esc(boat_label())} passage brief</div>
   <h1>{esc(title)}</h1>
   <p class="lede">{esc(ctx['origin'])} to {esc(dest)}, leaving {dep.astimezone(oz):%A %d %B, %H:%M} {esc(ctx['origin_label'])}. A forecast of each day at sea for a Lagoon 42, built from ensemble and deterministic weather models.</p>
-  <p class="meta">Forecast data fetched {esc(man['fetched_utc'])} (UTC). Every time below is local: {esc(ctx['origin_label'])} at departure, {esc(ctx['dest_label'])} at arrival.</p>
+  <p class="meta">Built {b['built_utc']:%Y-%m-%d %H:%M} UTC from data downloaded {esc(man['fetched_utc'])} (UTC), {b['age']['fetch_age_h']:.0f} h earlier. Model cycles when it was built: {ages(b['age'])}.{stale_note}</p>
+  <p class="meta">Every time below is local: {esc(ctx['origin_label'])} at departure, {esc(ctx['dest_label'])} at arrival.</p>
   <nav class="toc" aria-label="Contents"><span class="eyebrow">Contents</span><ol>
     <li><a href="#estimates">Trip estimates</a></li>
     <li><a href="#days">Day by day</a></li>
@@ -406,7 +433,7 @@ def render(b, title):
 
     # day by day tables
     h.append("""<section id="days"><h2>Day by day</h2>
-<p class="col">Each day runs 24 hours from departure. Figures are medians across the ensemble passages. Wind is true wind at 10 m. TWA is the true wind angle to the route. Waves are the higher of the two wave models, with the lowest ratio of period in seconds to height in meters. The limit is """ + f"{windows.LIMITS['period_ratio']:g}" + """, the rule that the period in seconds should be at least the height in feet. Comfort shows the level for most of the day, then the worst level lasting 3 hours or more, with where the seas come from, the strongest apparent wind, the roughest motion and what caused the worst spell.</p>""")
+<p class="col">Each day runs 24 hours from departure. Figures are medians across the ensemble passages. Wind is true wind at 10 m. TWA is the true wind angle to the route. Waves are the higher of the two wave models. The feet rule is the swell's peak period in seconds per foot of wave height, shown as the median for the day and the steepest hour in it: 3:1 or better needs no thought, under 2:1 is worth thinking hard about, and 1:1 is a square sea. A 3 m sea reads 3:1 at 30 s, 2:1 at 20 s and 1:1 at 10 s. Seas under """ + f"{windows.LIMITS['feet_min_hs']:g}" + """ m are left out of it. After the ratio comes the steepness forecasters use, wavelength over height as 1 in N: waves break near 1 in 7, 1 in """ + f"{windows.LIMITS['steep_no_n']:g}" + """ is the limit quoted for small craft, and 1 in """ + f"{windows.LIMITS['steep_warn_n']:g}" + """ is a steep sea. Comfort shows the level for most of the day, then the worst level lasting 3 hours or more, with where the seas come from, the strongest apparent wind, the roughest motion and what caused the worst spell.</p>""")
     for p in b["polars"]:
         h.append(f"""<h3>{esc(p['name'])}</h3><div class="tablewrap"><table>
 <thead><tr><th>Day</th><th>Wind kt<span class="sub">mean / max</span></th><th>Gust kt</th><th>From</th><th>TWA</th>
@@ -415,7 +442,7 @@ def render(b, title):
             partial = "" if r["n"] == r["of"] else f'<span class="sub">{r["n"]} of {r["of"]} still sailing</span>'
             h.append(f"""<tr><td>Day {r['day']}<span class="sub">to {r['end']:%a %d %H:%M}</span></td>
 <td>{r['tws']:.0f} / {r['tws_max']:.0f}</td><td>{r['gust']:.0f}</td><td>{r['twd']:03.0f}° {SR.compass(r['twd'])}</td><td>{r['twa']:.0f}°</td>
-<td>{r['hs']:.1f} m, {r['per']:.0f} s<span class="sub">T/H {r['ratio']:.1f}</span></td><td>{r['speed']:.1f}</td><td>{r['dist']:.0f}<span class="sub">{r['d10']:.0f} to {r['d90']:.0f}</span>{partial}</td>
+<td>{r['hs']:.1f} m, {r['per']:.0f} s<span class="sub">{feet_text(r['ratio'], r['ratio_worst'])}{steep_sub(r.get('steep_n'))}</span></td><td>{r['speed']:.1f}</td><td>{r['dist']:.0f}<span class="sub">{r['d10']:.0f} to {r['d90']:.0f}</span>{partial}</td>
 <td>{r['total']:.0f}</td><td>{r['motor']:.1f}<span class="sub">{r['fuel']:.0f}</span></td>
 <td class="l"><span class="chip {LEVEL_CLASS[r['main']]}">{r['main']}</span> <span class="chip {LEVEL_CLASS[r['worst']]}">{r['worst']}</span>
 <span class="sub">seas {comfort.SEA_SECTOR_NAMES[max(r['sea'], key=r['sea'].get)]} {max(r['sea'].values()):.0%}, apparent {r['aws']:.0f} kt, motion {r['accel']:.2f} m/s²</span>
@@ -481,6 +508,7 @@ def render(b, title):
 <h3>Weather data</h3>
 <ul class="tight">
 <li>Wind ensembles: ECMWF ENS and NOAA GEFS through Open-Meteo. Runs: {runs(man['models'])}.</li>
+<li>Data age when this brief was built: {ages(b['age'])}. The synoptic grid was downloaded {b['syn_age']['fetch_age_h']:.0f} h before the brief, from {ages(b['syn_age'])}. A brief is refused outright when the wind, wave or current data is older than the limits in Settings.</li>
 <li>Surface currents: Météo-France SMOC through Open-Meteo, 8 km, hourly, 10 days, tides included. The boat holds the line, so current along the line changes speed over ground and a cross current costs a little speed.</li>
 <li>Waves: the ECMWF and GFS wave models, single runs. Open-Meteo's wave ensembles returned no data.</li>
 <li>Synoptic grid: {smeta.get('step', 2.5):g}° from {fmt_lat(smeta['lats'][0])} to {fmt_lat(smeta['lats'][-1])}, {fmt_lon(smeta['lons'][0])} to {fmt_lon(smeta['lons'][-1])}, every 6 hours. Surface and column values at the boat come from each model at 0.25° route points, because a coarse grid point near an island can sit on land.</li>

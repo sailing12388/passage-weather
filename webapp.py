@@ -281,7 +281,14 @@ def settings_page(msg=""):
 <div><label>Gust no-go, kt</label>{num("gust_no", L["gust_no"], "1")}</div>
 <div><label>Waves forward of the beam, m</label>{num("hs", L["hs"])}</div>
 <div><label>Waves any direction, m</label>{num("hs_no", L["hs_no"])}</div>
-<div><label>Period rule (period in s per m of height)</label>{num("period_ratio", L["period_ratio"], "0.01")}</div>
+<div><label>Feet rule: clear at (period s per ft)</label>{num("feet_clear", L["feet_clear"], "0.1")}</div>
+<div><label>Feet rule: warn under</label>{num("feet_warn", L["feet_warn"], "0.1")}</div>
+<div><label>Feet rule: no-go under</label>{num("feet_no", L["feet_no"], "0.1")}</div>
+<div><label>Feet rule ignored below, m</label>{num("feet_min_hs", L["feet_min_hs"], "0.1")}</div>
+<div><label>Big seas for the 2:1 to 3:1 band, m</label>{num("feet_big_hs", L["feet_big_hs"], "0.1")}</div>
+<div><label>Steepness: warn steeper than 1 in</label>{num("steep_warn_n", L["steep_warn_n"], "1")}</div>
+<div><label>Steepness: no-go steeper than 1 in</label>{num("steep_no_n", L["steep_no_n"], "1")}</div>
+<div><label>Steepness ignored below, m</label>{num("steep_min_hs", L["steep_min_hs"], "0.1")}</div>
 <div><label>Tier share</label>{num("tier_share", s["tier_share"], "0.01")}</div>
 <div><label>Gust factor</label>{num("gust_factor", s["gust_factor"], "0.01")}</div>
 </div></div>
@@ -389,7 +396,9 @@ class Handler(BaseHTTPRequestHandler):
         sources = fields.get("sources")          # checkboxes: every ticked value
         values = {
             "limits": {k: float(form[k]) for k in ("tws_warn", "tws_no", "gust_warn", "gust_no", "hs", "hs_no",
-                                                   "period_ratio")},
+                                                   "feet_clear", "feet_warn", "feet_no", "feet_min_hs",
+                                                   "feet_big_hs", "steep_warn_n", "steep_no_n",
+                                                   "steep_min_hs")},
             "tier_share": float(form["tier_share"]), "gust_factor": float(form["gust_factor"]),
             "motor": {k: float(form[k]) for k in ("below_kt", "speed_kt", "fuel_gph")},
             "polar": {"sources": sources if sources is not None else s["polar"]["sources"],

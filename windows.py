@@ -21,8 +21,10 @@ from pathlib import Path
 import numpy as np
 
 import comfort
+import fetch
 import polar
 import route
+import seastate
 import settings
 
 HERE = Path(__file__).parent
@@ -52,7 +54,20 @@ WIND_MODELS = {"ecmwf_ifs025": "ECMWF", "gfs_seamless": "GEFS"}
 POINTS_OF_SAIL = (("up", 75), ("beam", 110), ("broad", 150), ("run", 181))
 TACK_ANGLE = 60             # the conservative polar starts at 60 TWA, so a beat is sailed there
 WAVE_MODELS = {"ecmwf_wam025": "ECMWF", "ncep_gfswave025": "GFS"}
+FT_PER_M = 3.28084
+SPELL_H = 3.0            # a sea has to stay steep this long before it flags a passage
 MIN_COMPLETE = 0.8      # a departure is scored only if this share of members arrive inside the forecast
+
+
+def steepness_n(period_s, hs_m):
+    """Steepness as 1 in N, wavelength over height. Smaller is steeper: breaking near 1 in 7."""
+    return seastate.steepness_n(hs_m, period_s)
+
+
+def feet_ratio(period_s, hs_m):
+    """The feet rule: period in seconds per foot of wave height, judged on the swell's peak
+    period. 2:1 or better is comfortable, under 1:1 is a square sea."""
+    return period_s / (hs_m * FT_PER_M) if hs_m > 0 else math.inf
 
 
 def load(run_dir):
@@ -75,8 +90,18 @@ def load(run_dir):
         t, h = members(f"{model}.json", "wave_height")
         _, per = members(f"{model}.json", "wave_period")
         _, wdir = members(f"{model}.json", "wave_direction")    # direction the waves come from
-        waves[model] = dict(times=t, hs=h[0], period=per[0], dir=wdir[0])
+        # The feet rule reads the dominant swell. ECMWF publishes that as wave_peak_period;
+        # GFS-Wave's wave_period is already the primary system's peak (GRIB perpw, checked
+        # against raw GRIB 2026-09-28), while ECMWF's wave_period is a spectral mean.
+        peak = None
+        if "wave_peak_period" in json.loads((run_dir / f"{model}.json").read_text())[0]["hourly"]:
+            _, pk = members(f"{model}.json", "wave_peak_period")
+            peak = pk[0]
+        elif model.startswith("ncep_gfswave"):
+            peak = per[0]
+        waves[model] = dict(times=t, hs=h[0], period=per[0], peak=peak, dir=wdir[0])
     manifest = json.loads((run_dir / "manifest.json").read_text())
+    fetch.check_fresh(manifest)          # every report comes through here, so stale data stops here
     waves["_currents"] = load_currents(run_dir)
     return wind, waves, manifest
 
@@ -181,6 +206,12 @@ def sail(m, depart, wind, waves, vmc, rt, log=None, vmc_night=None):
                current_along_nm=0.0,
                **{f"{k}_h": 0.0 for k, _ in POINTS_OF_SAIL}, **{f"sea_{k}_h": 0.0 for k in comfort.SEA_SECTORS},
                **{f"hs_{w}": 0.0 for w in WAVE_MODELS}, **{f"ratio_{w}": math.inf for w in WAVE_MODELS},
+               **{f"steep_h_{w}": 0.0 for w in WAVE_MODELS}, **{f"square_h_{w}": 0.0 for w in WAVE_MODELS},
+               **{f"think_h_{w}": 0.0 for w in WAVE_MODELS},
+               **{f"steep_n_{w}": math.inf for w in WAVE_MODELS},
+               **{f"steep_n_h_{w}": 0.0 for w in WAVE_MODELS}, **{f"steep_n_no_h_{w}": 0.0 for w in WAVE_MODELS},
+               **{f"_steep_n_{w}": [] for w in WAVE_MODELS},
+               **{f"_ratios_{w}": [] for w in WAVE_MODELS},
                **{f"wave_warn_{w}": False for w in WAVE_MODELS}, **{f"wave_no_{w}": False for w in WAVE_MODELS},
                **{f"wave_why_{w}": set() for w in WAVE_MODELS})
     while dist < total:
@@ -230,14 +261,16 @@ def sail(m, depart, wind, waves, vmc, rt, log=None, vmc_night=None):
         for wm, wv in waves.items():
             wi = int((t - wv["times"][0]).total_seconds() // 3600)
             if wi >= wv["hs"].shape[0]:
-                sea[wm] = (np.nan, np.nan, np.nan)
+                sea[wm] = (np.nan, np.nan, np.nan, np.nan)
                 continue
             hs, per, wdir_from = wv["hs"][wi, p], wv["period"][wi, p], wv["dir"][wi, p]
-            sea[wm] = (hs, per, wdir_from)
+            pk = wv["peak"][wi, p] if wv.get("peak") is not None else per
+            if math.isnan(pk):
+                pk = per                       # no peak period published: fall back to the mean
+            sea[wm] = (hs, per, wdir_from, pk)
             if not math.isnan(hs):
                 out[f"hs_{wm}"] = max(out[f"hs_{wm}"], hs)
                 if hs > 0.1 and not math.isnan(per):
-                    out[f"ratio_{wm}"] = min(out[f"ratio_{wm}"], per / hs)
                     if not math.isnan(wdir_from):
                         rels = [comfort.relative_sea(wdir_from, hd) for hd in headings]
                         a_model = float(np.mean([comfort.vertical_accel(hs, per, hull_kt, r) for r in rels]))
@@ -247,9 +280,23 @@ def sail(m, depart, wind, waves, vmc, rt, log=None, vmc_night=None):
                         if hs > LIMITS["hs"] and forward:
                             out[f"wave_warn_{wm}"] = True
                             out[f"wave_why_{wm}"].add(f"over {LIMITS['hs']:.0f} m forward of the beam")
-                        if per < LIMITS["period_ratio"] * hs:
-                            out[f"wave_warn_{wm}"] = True
-                            out[f"wave_why_{wm}"].add("steeper than the feet rule")
+                        fr = feet_ratio(pk, hs)
+                        out[f"ratio_{wm}"] = min(out[f"ratio_{wm}"], fr)
+                        out[f"_ratios_{wm}"].append(fr)
+                        sn = steepness_n(pk, hs)
+                        out[f"_steep_n_{wm}"].append(sn)
+                        if hs >= LIMITS["steep_min_hs"]:
+                            if sn < LIMITS["steep_no_n"]:
+                                out[f"steep_n_no_h_{wm}"] += STEP_H
+                            elif sn < LIMITS["steep_warn_n"]:
+                                out[f"steep_n_h_{wm}"] += STEP_H
+                        if hs >= LIMITS["feet_min_hs"]:
+                            if fr < LIMITS["feet_no"]:
+                                out[f"square_h_{wm}"] += STEP_H
+                            elif fr < LIMITS["feet_warn"]:
+                                out[f"steep_h_{wm}"] += STEP_H
+                            elif fr < LIMITS["feet_clear"] and hs >= LIMITS["feet_big_hs"]:
+                                out[f"think_h_{wm}"] += STEP_H
                         if hs > LIMITS["hs_no"]:
                             out[f"wave_no_{wm}"] = True
                             out[f"wave_why_{wm}"].add(f"over {LIMITS['hs_no']:.0f} m")
@@ -266,7 +313,8 @@ def sail(m, depart, wind, waves, vmc, rt, log=None, vmc_night=None):
             log.append(dict(t=t, dist=dist, tws=s, gust=g, twd=d, course_twa=course_twa, v=v,
                             motoring=motoring, pos=pos, aws=aws, accel=step_accel, comfort=step_level, sea_side=side,
                             **{f"hs_{wm}": sea[wm][0] for wm in waves},
-                            **{f"per_{wm}": sea[wm][1] for wm in waves}))
+                            **{f"per_{wm}": sea[wm][1] for wm in waves},
+                            **{f"peak_{wm}": sea[wm][3] for wm in waves}))
         out["max_tws"] = max(out["max_tws"], s)
         out["max_gust"] = max(out["max_gust"], g)
         sog, along = v, 0.0
@@ -294,6 +342,29 @@ def sail(m, depart, wind, waves, vmc, rt, log=None, vmc_night=None):
     sides_h = sum(out[f"sea_{k}_h"] for k in comfort.SEA_SECTORS)
     for k in comfort.SEA_SECTORS:
         out[f"sea_{k}_share"] = out[f"sea_{k}_h"] / sides_h if sides_h else 0.0
+    for wm in WAVE_MODELS:
+        rs = out.pop(f"_ratios_{wm}")
+        out[f"ratio_med_{wm}"] = float(np.median(rs)) if rs else math.inf
+        sns = out.pop(f"_steep_n_{wm}")
+        out[f"steep_n_{wm}"] = float(np.median(sns)) if sns else math.inf
+        sq_n, st_n = out[f"steep_n_no_h_{wm}"], out[f"steep_n_h_{wm}"]
+        if sq_n >= SPELL_H:
+            out[f"wave_no_{wm}"] = True
+            out[f"wave_why_{wm}"].add(f"steeper than 1 in {LIMITS['steep_no_n']:g}, dangerous for small craft")
+        if sq_n + st_n >= SPELL_H:
+            out[f"wave_warn_{wm}"] = True
+            out[f"wave_why_{wm}"].add(f"steeper than 1 in {LIMITS['steep_warn_n']:g}")
+        square, steep, think = (out[f"square_h_{wm}"], out[f"steep_h_{wm}"], out[f"think_h_{wm}"])
+        if square >= SPELL_H:
+            out[f"wave_no_{wm}"] = True
+            out[f"wave_why_{wm}"].add(f"square sea, under {LIMITS['feet_no']:g} : 1")
+        if square + steep + think >= SPELL_H:
+            out[f"wave_warn_{wm}"] = True
+            if square + steep >= SPELL_H:
+                out[f"wave_why_{wm}"].add(f"under {LIMITS['feet_warn']:g} : 1")
+            else:
+                out[f"wave_why_{wm}"].add(f"under {LIMITS['feet_clear']:g} : 1 in seas over "
+                                         f"{LIMITS['feet_big_hs']:g} m")
     out["day_entry"] = entry_ok(t)
     out["breach"] = {
         "tws_warn": out["max_tws"] > LIMITS["tws_warn"], "tws_no": out["max_tws"] > LIMITS["tws_no"],
@@ -314,6 +385,12 @@ def summarize(done, n_all):
         tws_p50=q("max_tws", 50), tws_p90=q("max_tws", 90), gust_p90=q("max_gust", 90),
         **{f"hs_{wm}_p90": q(f"hs_{wm}", 90) for wm in WAVE_MODELS},
         **{f"ratio_{wm}_p10": q(f"ratio_{wm}", 10) for wm in WAVE_MODELS},
+        **{f"ratio_med_{wm}_p50": q(f"ratio_med_{wm}", 50) for wm in WAVE_MODELS},
+        **{f"steep_h_{wm}_p50": q(f"steep_h_{wm}", 50) for wm in WAVE_MODELS},
+        **{f"think_h_{wm}_p50": q(f"think_h_{wm}", 50) for wm in WAVE_MODELS},
+        **{f"steep_n_{wm}_p50": q(f"steep_n_{wm}", 50) for wm in WAVE_MODELS},
+        **{f"steep_n_h_{wm}_p50": q(f"steep_n_h_{wm}", 50) + q(f"steep_n_no_h_{wm}", 50) for wm in WAVE_MODELS},
+        **{f"square_h_{wm}_p50": q(f"square_h_{wm}", 50) for wm in WAVE_MODELS},
         **{f"p_wave_{wm}": pr(lambda r, wm=wm: r["wave_breach"][wm]) for wm in WAVE_MODELS},
         **{f"p_wave_no_{wm}": pr(lambda r, wm=wm: r[f"wave_no_{wm}"]) for wm in WAVE_MODELS},
         **{f"wave_why_{wm}": sorted(set().union(*[r[f"wave_why_{wm}"] for r in done])) for wm in WAVE_MODELS},

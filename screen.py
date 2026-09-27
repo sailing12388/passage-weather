@@ -7,6 +7,7 @@ One departure per day, at local noon at the origin.
 """
 import html
 import json
+import math
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -40,6 +41,11 @@ def slot_summary(row):
         gust90=max(r["gust_p90"] for r in both),
         hs90=max(max(r["hs_ecmwf_wam025_p90"], r["hs_ncep_gfswave025_p90"]) for r in both),
         ratio10=min(min(r["ratio_ecmwf_wam025_p10"], r["ratio_ncep_gfswave025_p10"]) for r in both),
+        ratio_med=min(min(r["ratio_med_ecmwf_wam025_p50"], r["ratio_med_ncep_gfswave025_p50"]) for r in both),
+        ratio_ec=min(r["ratio_med_ecmwf_wam025_p50"] for r in both),
+        ratio_gfs=min(r["ratio_med_ncep_gfswave025_p50"] for r in both),
+        steep_n=min(min(r.get("steep_n_ecmwf_wam025_p50", math.inf),
+                        r.get("steep_n_ncep_gfswave025_p50", math.inf)) for r in both),
         hours50=np.mean([r["hours_p50"] for r in both]), hours10=min(r["hours_p10"] for r in both),
         hours90=max(r["hours_p90"] for r in both), arrive=e["arrive_p50"], p_day=np.mean([r["p_day"] for r in both]),
         motor50=max(r["motor_p50"] for r in both), current_kt=float(np.mean([r["current_kt"] for r in both])),
@@ -59,8 +65,20 @@ def wave_warnings(row):
         why = sorted(set().union(*[set(row[m].get(f"wave_why_{wm}", [])) for m in windows.WIND_MODELS]))
         hs = max(row[m][f"hs_{wm}_p90"] for m in windows.WIND_MODELS)
         no = max(row[m][f"p_wave_no_{wm}"] for m in windows.WIND_MODELS) > windows.WAVE_FLAG_SHARE
-        out.append(f"{name} wave model: {', '.join(why) or 'over your wave rules'} (to {hs:.1f} m)"
-                   + (", a no-go" if no else ""))
+        steep_h = max(row[m].get(f"steep_h_{wm}_p50", 0) + row[m].get(f"square_h_{wm}_p50", 0)
+                      + row[m].get(f"think_h_{wm}_p50", 0) for m in windows.WIND_MODELS)
+        # summaries saved before the feet bands went in have no median ratio
+        ratio = min(row[m].get(f"ratio_med_{wm}_p50", math.inf) for m in windows.WIND_MODELS)
+        bits = [f"to {hs:.1f} m"]
+        if math.isfinite(ratio):
+            bits.append(f"median {ratio:.1f} : 1")
+        if steep_h >= windows.SPELL_H:
+            bits.append(f"{steep_h:.0f} h of the passage")
+        steep_n_h = max(row[m].get(f"steep_n_h_{wm}_p50", 0) for m in windows.WIND_MODELS)
+        if steep_n_h >= windows.SPELL_H:
+            bits.append(f"steep for {steep_n_h:.0f} h")
+        out.append(f"{name} wave model: {', '.join(why) or 'over your wave rules'} "
+                   f"({', '.join(bits)})" + (", a no-go" if no else ""))
     return out
 
 
@@ -71,6 +89,11 @@ def point_of_sail_text(shares):
     """'62% broad reach, 38% beam reach': every band with 5% or more, largest first."""
     parts = sorted(((shares[f"{k}_share"], k) for k, _ in windows.POINTS_OF_SAIL), reverse=True)
     return ", ".join(f"{v:.0%} {POS_NAMES[k]}" for v, k in parts if v >= 0.05) or "not enough data"
+
+
+def steep_text(n):
+    """Steepness as forecasters quote it, if it is worth quoting: waves break near 1 in 7."""
+    return f" · steepness 1 in {n:.0f}" if n is not None and math.isfinite(n) else ""
 
 
 def wave_periods(sea):
@@ -201,7 +224,10 @@ def render(t, days, manifest, history):
     first, last = t.window()
     now = datetime.now(timezone.utc)
     ozn, dzn = T.tz_abbrev(first, oz), T.tz_abbrev(first, dz)
-    runs = ", ".join(f"{esc(v['label'])} {esc(v['run'] or 'run time not published')}" for v in manifest["models"].values())
+    age = fetch.data_age(manifest)
+    runs = ", ".join(f"{esc(v['label'])} {esc(v['run'] or 'run time not published')}"
+                     + (f" ({m['age_h']:.0f} h old)" if (m := age["models"].get(k)) and m["age_h"] is not None else "")
+                     for k, v in manifest["models"].items())
     L = windows.LIMITS
     h = [f"""<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(t.title())} options</title>
@@ -213,7 +239,7 @@ def render(t, days, manifest, history):
   <div class="eyebrow">{esc(report_html.boat_label())} departure options</div>
   <h1>{esc(t.title())}</h1>
   <p class="lede">Leaving at noon any day from {first:%A %d %B} for {t.days} days. {route.total_nm():.0f} nm on the great circle.</p>
-  <p class="meta">Forecast fetched {esc(manifest['fetched_utc'])} UTC. Runs: {runs}. Departure times in {ozn} ({esc(t.origin['tz'])}), arrivals in {dzn} ({esc(t.dest['tz'])}).</p>
+  <p class="meta">Forecast fetched {esc(manifest['fetched_utc'])} UTC, {age['fetch_age_h']:.0f} h ago. Runs: {runs}. Departure times in {ozn} ({esc(t.origin['tz'])}), arrivals in {dzn} ({esc(t.dest['tz'])}).</p>
 </header>
 <p class="callout"><b>{esc(recommendation(t, days))}</b></p>
 <section id="days-grid"><div class="cards">"""]
@@ -231,7 +257,7 @@ def render(t, days, manifest, history):
 <dl>
 <dt>Wind</dt><dd>over {L['tws_warn']:.0f} kt {b['p_tws']:.0%}, over {L['tws_no']:.0f} kt {b['p_tws_no']:.0%}<span class="sub">gusts over {L['gust_warn']:.0f} kt {b['p_gust']:.0%}, over {L['gust_no']:.0f} kt {b['p_gust_no']:.0%}</span></dd>
 <dt>Strongest</dt><dd>{b['tws50']:.0f} kt, 90th pct {b['tws90']:.0f}<span class="sub">gusts {b['gust90']:.0f} kt</span></dd>
-<dt>Waves</dt><dd>{b['hs90']:.1f} m{wave_periods(d.get('sea'))}<span class="sub">T/H {b['ratio10']:.1f}</span></dd>
+<dt>Waves</dt><dd>{b['hs90']:.1f} m{wave_periods(d.get('sea'))}<span class="sub">feet rule ECMWF {b['ratio_ec']:.1f} : 1, GFS {b['ratio_gfs']:.1f} : 1{steep_text(b.get('steep_n'))}</span></dd>
 <dt>Point of sail</dt><dd>{point_of_sail_text(b)}</dd>
 <dt>Current</dt><dd>{current_text(b['current_kt'])}</dd>
 <dt>At sea</dt><dd>{b['hours50']:.0f} h<span class="sub">{b['hours10']:.0f} to {b['hours90']:.0f} h</span></dd>

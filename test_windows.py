@@ -6,6 +6,7 @@ import numpy as np
 from pathlib import Path
 import requests
 
+import comfort
 import polar
 import route
 import windows
@@ -17,12 +18,13 @@ N_T, N_P = 24 * 10, len(route.sample_points())
 COURSE = route.gc_bearing(*route.WAYPOINTS[0][1:], *route.WAYPOINTS[1][1:])
 
 
-def synthetic(tws, twd_from, gust=None, hs=1.5, period=9.0, wave_from=None, current_kt=0.0, current_towards=0.0):
+def synthetic(tws, twd_from, gust=None, hs=1.5, period=9.0, peak=None, wave_from=None, current_kt=0.0, current_towards=0.0):
     times = [T0 + timedelta(hours=i) for i in range(N_T)]
     full = lambda v: np.full((N_T, N_P), float(v))
     wind = dict(times=times, spd=full(tws)[None], dir=full(twd_from)[None], gust=full(gust or tws * 1.3)[None])
     wave_from = twd_from if wave_from is None else wave_from
-    waves = {wm: dict(times=times, hs=full(hs), period=full(period), dir=full(wave_from)) for wm in windows.WAVE_MODELS}
+    waves = {wm: dict(times=times, hs=full(hs), period=full(period), peak=full(peak if peak else period),
+                      dir=full(wave_from)) for wm in windows.WAVE_MODELS}
     c = math.radians(current_towards)
     waves["_currents"] = dict(times=times, east=full(current_kt * math.sin(c)), north=full(current_kt * math.cos(c)))
     return wind, waves
@@ -85,23 +87,27 @@ def test_waves_recorded_per_model():
 
 def test_wave_rules_use_period_and_direction():
     """Height alone isn't a no-go: it depends on the period and where the seas hit."""
+
     trade = (COURSE + 140) % 360
     astern, ahead = (COURSE + 180) % 360, COURSE
-    big_following = run(16, trade, hs=3.2, period=12.0, wave_from=astern)
-    big_ahead = run(16, trade, hs=3.2, period=12.0, wave_from=ahead)
-    steep = run(16, trade, hs=2.5, period=7.0, wave_from=astern)          # 7 s < 2.5 m in feet (8.2 s)
-    huge = run(16, trade, hs=4.5, period=14.0, wave_from=astern)
-    calm = run(16, trade, hs=2.0, period=10.0, wave_from=astern)
     wm = "ecmwf_wam025"
-    assert not big_following[f"wave_warn_{wm}"] and not big_following[f"wave_no_{wm}"], big_following[f"wave_why_{wm}"]
-    assert big_ahead[f"wave_warn_{wm}"] and not big_ahead[f"wave_no_{wm}"], big_ahead[f"wave_why_{wm}"]
-    assert "over 3 m forward of the beam" in big_ahead[f"wave_why_{wm}"]
-    assert steep[f"wave_warn_{wm}"] and "steeper than the feet rule" in steep[f"wave_why_{wm}"]
+    # a 2 m sea at 20 s clears every band: 3.05 : 1
+    easy = run(16, trade, hs=2.0, period=20.0, peak=20.0, wave_from=astern)
+    assert not easy[f"wave_warn_{wm}"] and not easy[f"wave_no_{wm}"], easy[f"wave_why_{wm}"]
+    # 3.2 m at 22 s is 2.1 : 1, so it warns whichever way it runs, but on the bow the height
+    # counts against it as well: the reasons have to say so
+    long_following = run(16, trade, hs=3.2, period=22.0, peak=22.0, wave_from=astern)
+    long_ahead = run(16, trade, hs=3.2, period=22.0, peak=22.0, wave_from=ahead)
+    assert long_following[f"wave_warn_{wm}"] and not long_following[f"wave_no_{wm}"], long_following[f"wave_why_{wm}"]
+    assert "over 3 m forward of the beam" not in long_following[f"wave_why_{wm}"]
+    assert "over 3 m forward of the beam" in long_ahead[f"wave_why_{wm}"]
+    # height alone still is not the test: 4.5 m is out whatever the period does
+    huge = run(16, trade, hs=4.5, period=20.0, peak=20.0, wave_from=astern)
     assert huge[f"wave_no_{wm}"] and "over 4 m" in huge[f"wave_why_{wm}"]
-    assert not calm[f"wave_warn_{wm}"] and not calm[f"wave_no_{wm}"], calm[f"wave_why_{wm}"]
-    # a steep sea on the bow throws the boat around enough to be a no-go on motion alone
-    rough = run(16, trade, hs=3.0, period=6.0, wave_from=ahead)
+    # a steep sea on the bow is rough enough to stop the passage on motion alone
+    rough = run(16, trade, hs=3.0, period=6.0, peak=6.0, wave_from=ahead)
     assert rough[f"wave_no_{wm}"] and "motion at the Rough band" in rough[f"wave_why_{wm}"], rough[f"wave_why_{wm}"]
+
 
 
 def test_pw_polar_and_night_factor():
@@ -422,6 +428,8 @@ def test_full_brief_builds_from_saved_data(no_performance_polar=False):
     depart = t.window()[0]
     ctx = dict(trip=t.slug, origin=t.origin["name"], dest=t.dest["name"], origin_tz=t.origin_tz, dest_tz=t.dest_tz,
                origin_label="origin time", dest_label="destination time", chart_label="LT")
+    import os
+    os.environ["PASSAGE_ALLOW_STALE"] = "1"    # saved data on purpose; freshness is tested separately
     saved_pw = polar.PW_FILE
     if no_performance_polar:
         polar.PW_FILE = None
@@ -430,6 +438,7 @@ def test_full_brief_builds_from_saved_data(no_performance_polar=False):
         page = report_html.render(b, "smoke test")
     finally:
         polar.PW_FILE = saved_pw
+        os.environ.pop("PASSAGE_ALLOW_STALE", None)
     assert "Trip estimates" in page and "Point of sail" in page and "Current" in page, page[:500]
     if (run_dir / "ncep_gfswave025.json").exists() and "swell_wave_height" in (run_dir / "ncep_gfswave025.json").read_text()[:5000]:
         assert 'id="sea"' in page and "Wind sea" in page and "Whole passage" in page, "sea section missing"
@@ -576,6 +585,172 @@ def test_entry_window():
     assert windows.entry_ok(local(10))
     assert not windows.entry_ok(local(3))
     assert not windows.entry_ok(local(21))
+
+
+def test_steepness_is_the_physical_cross_check():
+    """Forecasters judge a sea by its steepness, 1 in N of length over height: breaking at 1 in 7,
+    dangerous by 1 in 20, steep by 1 in 40 (NDBC, Burch). It backs up the feet bands and catches
+    the small steep chop that the feet rule's height floor leaves out."""
+    trade, astern = (COURSE + 140) % 360, (COURSE + 180) % 360
+    wm = "ecmwf_wam025"
+    for hs, peak, want_steep, want_dangerous, note in (
+            (1.5, 4.0, True, True, "1 in 17, dangerous"),
+            (1.5, 5.0, True, False, "1 in 26, steep"),
+            (1.2, 4.5, True, False, "1 in 26 in a 1.2 m chop, under the feet rule's floor"),
+            (3.0, 13.0, False, False, "1 in 88, a long swell is not steep"),
+            (0.7, 3.0, False, False, "1 in 20 but only 0.7 m: not a hazard to this boat")):
+        r = run(16, trade, hs=hs, period=peak, peak=peak, wave_from=astern)
+        why = " ".join(r[f"wave_why_{wm}"])
+        assert (f"1 in {windows.LIMITS['steep_warn_n']:g}" in why) == want_steep, f"{note}: {why}"
+        assert (f"1 in {windows.LIMITS['steep_no_n']:g}" in why) == want_dangerous, f"{note}: {why}"
+        if want_dangerous:
+            assert r[f"wave_no_{wm}"], f"{note}: {why}"
+    # the steepness number itself is reported, so it can go on the page
+    r = run(16, trade, hs=3.0, period=13.0, peak=13.0, wave_from=astern)
+    assert abs(r[f"steep_n_{wm}"] - 88) < 2, r[f"steep_n_{wm}"]
+
+
+def test_feet_rule_is_judged_on_the_peak_period():
+    """Industry norm: the rule reads the dominant swell's period, not the mean of everything."""
+    trade, astern = (COURSE + 140) % 360, (COURSE + 180) % 360
+    wm = "ecmwf_wam025"
+    # 3 m with a 13 s swell peak is 1.3:1 even though the chop pulls the mean period to 7 s
+    mixed = run(16, trade, hs=3.0, period=7.0, peak=13.0, wave_from=astern)
+    assert "dangerous" not in " ".join(mixed[f"wave_why_{wm}"]), mixed[f"wave_why_{wm}"]
+    assert not mixed[f"wave_no_{wm}"], mixed[f"wave_why_{wm}"]
+    # the same sea judged on the 7 s mean would have been called a square sea
+    assert windows.feet_ratio(7.0, 3.0) < 1.0 < windows.feet_ratio(13.0, 3.0)
+    # motion still uses the mean period, so the chop is not lost from the comfort side
+    calm_mean = run(16, trade, hs=3.0, period=13.0, peak=13.0, wave_from=astern)
+    best = len(comfort.LEVELS) - 1                     # hours at the easiest level
+    assert mixed["comfort_h"][best] < calm_mean["comfort_h"][best], (mixed["comfort_h"], calm_mean["comfort_h"])
+
+
+def test_feet_rule_bands():
+    """3:1 and there is nothing to think about, under 2:1 warns, 1:1 is a square sea. Between
+    2:1 and 3:1 it warns only in big seas, since a small steep chop is not a reason to stay in."""
+    trade, astern = (COURSE + 140) % 360, (COURSE + 180) % 360
+    wm = "ecmwf_wam025"
+    for hs, peak, want_warn, want_no, note in (
+            (2.5, 26.0, False, False, "3.17 : 1, no hesitation"),
+            (2.8, 20.0, True, False, "2.18 : 1 in big seas, think hard"),
+            (1.2, 9.0, False, False, "2.29 : 1 but only 1.2 m of sea"),
+            (0.9, 2.5, False, False, "0.85 : 1 chop, under both height floors"),
+            (3.0, 14.0, True, False, "1.42 : 1"),
+            (3.0, 9.0, True, True, "0.91 : 1, a square sea")):
+        r = run(16, trade, hs=hs, period=peak, peak=peak, wave_from=astern)
+        fr = windows.feet_ratio(peak, hs)
+        assert r[f"wave_warn_{wm}"] == want_warn, f"{note}: ratio {fr:.2f} warn={r[f'wave_warn_{wm}']} {r[f'wave_why_{wm}']}"
+        square = "square sea" in " ".join(r[f"wave_why_{wm}"])
+        assert square == want_no, f"{note}: ratio {fr:.2f} square={square} {r[f'wave_why_{wm}']}"
+
+
+def test_a_short_dip_below_the_line_does_not_flag_the_passage():
+    """The flag needs the sea to stay steep for 3 hours, as the comfort rating already does."""
+    trade, astern = (COURSE + 140) % 360, (COURSE + 180) % 360
+    wm = "ecmwf_wam025"
+    wind, waves = synthetic(16, trade, hs=2.0, period=14.0, peak=14.0, wave_from=astern)
+    for hours, expect in ((2, False), (5, True)):   # the spell has to reach 3 h
+        for w in waves.values():
+            if "peak" in w:
+                w["peak"][:] = 14.0
+                w["peak"][6:6 + hours, :] = 6.0        # a steep spell of `hours` hours
+        r = windows.sail(0, T0, wind, waves, VMC, RT)
+        assert r[f"wave_no_{wm}"] == expect, f"{hours} h below 1:1 gave no-go {r[f'wave_no_{wm}']}"
+
+
+def test_feet_ratio_matches_the_rule_that_fires():
+    """The pages show the ratio in the units the rule is stated in: period s per height ft."""
+    import windows as _w
+    trade = (COURSE + 140) % 360
+    for hs, per in ((3.0, 9.0), (3.0, 10.5), (2.0, 6.0), (2.0, 7.0), (2.5, 8.0), (1.8, 5.5)):
+        fr = windows.feet_ratio(per, hs)
+        assert abs(fr - per / (hs * windows.FT_PER_M)) < 1e-9, (hs, per, fr)
+        r = run(16, trade, hs=hs, period=per, peak=per, wave_from=(COURSE + 180) % 360)
+        broke = "square sea" in " ".join(r["wave_why_ecmwf_wam025"])
+        assert broke == (fr < 1.0), f"hs {hs} period {per}: ratio {fr:.2f} but square sea called {broke}"
+    assert abs(windows.feet_ratio(10.0, 3.0) - 1.02) < 0.01, windows.feet_ratio(10.0, 3.0)
+    assert windows.feet_ratio(10.0, 0.0) == math.inf
+
+
+def test_every_model_cycle_is_recorded_including_waves():
+    """The wave and current models publish run times on marine-api, so a fetch must record them."""
+    import time
+    import fetch
+    import requests
+    init = time.time() - 6 * 3600
+
+    class Fake:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"last_run_initialisation_time": init, "last_run_availability_time": init + 7 * 3600}
+
+    saved = requests.get
+    requests.get = lambda url, **kw: Fake()
+    try:
+        for model in ("ecmwf_ifs025", "gfs_seamless", "ecmwf_wam025", "ncep_gfswave025", "currents"):
+            info = fetch.model_run(model)
+            assert abs(info["run_epoch"] - init) < 1, (model, info)
+            assert info["run"], (model, info)
+    finally:
+        requests.get = saved
+
+
+def test_data_age_is_reported_per_model():
+    """What the report prints: how old every model cycle is at the time the report is built."""
+    import time
+    import fetch
+    now = time.time()
+    man = {"fetched_utc": "20260927T1843Z", "fetched_epoch": now - 3 * 3600, "models": {
+        "ecmwf_ifs025": {"label": "ECMWF ENS", "run": "2026-09-27 06 UTC", "run_epoch": now - 9 * 3600},
+        "ecmwf_wam025": {"label": "ECMWF waves", "run": "2026-09-26 06 UTC", "run_epoch": now - 30 * 3600}}}
+    age = fetch.data_age(man, now=now)
+    assert abs(age["fetch_age_h"] - 3) < 0.05, age
+    assert abs(age["models"]["ecmwf_ifs025"]["age_h"] - 9) < 0.05, age
+    assert age["models"]["ecmwf_wam025"]["stale"], age
+    assert not age["models"]["ecmwf_ifs025"]["stale"], age
+    try:
+        fetch.check_fresh(man, now=now)
+        assert False, "a 30 hour old wave cycle must stop a report"
+    except fetch.StaleData as e:
+        assert "ECMWF waves" in str(e), e
+    fetch.check_fresh(man, now=now, allow_stale=True)      # an explicit override still works
+
+
+def test_cycle_age_falls_back_to_the_run_text():
+    """Runs fetched before the epoch was recorded still report a real age, not a blank."""
+    import time
+    import fetch
+    now = datetime(2026, 9, 27, 18, tzinfo=timezone.utc).timestamp()
+    man = {"fetched_utc": "20260927T1200Z",
+           "models": {"ecmwf_ifs025": {"label": "ECMWF ENS", "run": "2026-09-27 06 UTC"}}}
+    age = fetch.data_age(man, now=now)
+    assert abs(age["models"]["ecmwf_ifs025"]["age_h"] - 12) < 0.05, age
+    assert abs(age["fetch_age_h"] - 6) < 0.05, age
+
+
+def test_stale_saved_data_cannot_reach_a_report():
+    """windows.load is the one door every report goes through, the guard belongs there."""
+    import os
+    import fetch
+    runs = sorted(d for d in Path("data").glob("*") if (d / "manifest.json").exists()) if Path("data").exists() else []
+    old = next((d for d in runs if (d / "ecmwf_ifs025.json").exists()), None)
+    if old is None:
+        print("  (skipped: no saved run)")
+        return
+    os.environ.pop("PASSAGE_ALLOW_STALE", None)
+    try:
+        windows.load(old)
+        assert False, f"{old.name} is weeks old and must not silently feed a report"
+    except fetch.StaleData as e:
+        assert "old" in str(e).lower(), e
+    os.environ["PASSAGE_ALLOW_STALE"] = "1"
+    try:
+        windows.load(old)                                  # the override lets old data through
+    finally:
+        os.environ.pop("PASSAGE_ALLOW_STALE", None)
 
 
 if __name__ == "__main__":
